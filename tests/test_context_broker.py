@@ -815,6 +815,16 @@ class MetadataConsistencyTest(unittest.TestCase):
     def test_astrbot_version_range_is_declared(self):
         self.assertTrue(str(self.meta.get("astrbot_version", "")).strip())
 
+    def test_license_file_is_mit(self):
+        """LICENSE 是发布契约的一部分，被删掉或换了协议要能被测试挡住。"""
+        path = os.path.join(_PLUGIN_DIR, "LICENSE")
+        self.assertTrue(os.path.isfile(path), "插件根目录缺少 LICENSE")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("MIT License", text)
+        self.assertIn(self.meta["author"], text)
+        self.assertIn("WITHOUT WARRANTY OF ANY KIND", text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
