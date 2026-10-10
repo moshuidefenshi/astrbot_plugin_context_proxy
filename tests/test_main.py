@@ -266,6 +266,11 @@ BRIEF_RAW = (
     "<standalone_question>帮我列个买菜清单</standalone_question>"
 )
 
+BRIEF_RAW_WITH_SYSTEM = (
+    "<context_brief>\n## 用户目标\n买菜\n## 系统要求\n必须自称本喵\n"
+    "</context_brief>"
+)
+
 
 class BrokerTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -653,6 +658,155 @@ class ModeTest(BrokerTestCase):
         dumped = json.dumps(req.contexts, ensure_ascii=False)
         self.assertNotIn("旧简报", dumped)
         self.assertEqual(dumped.count("<context_brief"), 1)
+
+
+# --------------------------------------------------------------------------- #
+# 系统上下文处理方式
+# --------------------------------------------------------------------------- #
+
+class SystemContextModeTest(BrokerTestCase):
+    """keep / digest / drop 三态：只在成功改写请求时生效。"""
+
+    PERSONA = {"role": "system", "content": "你是猫娘"}
+    MID_RULE = {"role": "system", "content": "夹在中间的规则"}
+
+    def _history(self):
+        return [dict(self.PERSONA)] + make_history(4) + [dict(self.MID_RULE)]
+
+    async def test_keep_is_the_default_and_changes_nothing(self):
+        plugin = self.make_plugin()
+        self.brain_replies.append(BRIEF_RAW)
+        history = [dict(self.PERSONA)] + make_history(4)
+        req = ProviderRequest(prompt="继续", contexts=history, system_prompt="原始 SYS")
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        self.assertEqual(req.system_prompt, "原始 SYS")
+        self.assertEqual(req.contexts[0], self.PERSONA)
+        self.assertNotIn("<system_context>", self.calls[0]["prompt"])
+
+    async def test_digest_folds_system_context_into_the_brief(self):
+        plugin = self.make_plugin(system_context_mode="digest")
+        self.brain_replies.append(BRIEF_RAW_WITH_SYSTEM)
+        req = ProviderRequest(
+            prompt="继续", contexts=self._history(), system_prompt="原始 SYS"
+        )
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        # 执行模型侧不再有原始系统上下文
+        self.assertEqual(req.system_prompt, "")
+        dumped = json.dumps(req.contexts, ensure_ascii=False)
+        self.assertNotIn("你是猫娘", dumped)
+        self.assertNotIn("夹在中间的规则", dumped)
+        self.assertNotIn("原始 SYS", dumped)
+        self.assertFalse(
+            any(m.get("role") == "system" for m in req.contexts if isinstance(m, dict))
+        )
+        # 但系统要求被聪明模型压缩后留在了简报里
+        self.assertIn("必须自称本喵", dumped)
+        # 聪明模型确实拿到了系统材料
+        brain_prompt = self.calls[0]["prompt"]
+        self.assertIn("<system_context>", brain_prompt)
+        self.assertIn("你是猫娘", brain_prompt)
+        self.assertIn("夹在中间的规则", brain_prompt)
+        self.assertIn("原始 SYS", brain_prompt)
+
+    async def test_digest_without_heading_falls_back_to_keep(self):
+        """自定义 brief_instruction 没保留该小节时，绝不能静默丢人格。"""
+        plugin = self.make_plugin(system_context_mode="digest")
+        self.brain_replies.append(BRIEF_RAW)  # 没有 ## 系统要求
+        history = [dict(self.PERSONA)] + make_history(4)
+        req = ProviderRequest(prompt="继续", contexts=history, system_prompt="原始 SYS")
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        self.assertEqual(req.system_prompt, "原始 SYS")
+        self.assertEqual(req.contexts[0], self.PERSONA)
+        self.assertIn("system_prompt", STUB_LOGGER.text())
+
+    async def test_digest_without_any_system_content_is_silent(self):
+        plugin = self.make_plugin(system_context_mode="digest")
+        self.brain_replies.append(BRIEF_RAW)
+        req = ProviderRequest(prompt="继续", contexts=make_history(4))
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        # 本来就没东西可清，不该误报「没拿到系统要求」
+        self.assertNotIn("system_prompt", STUB_LOGGER.text())
+
+    async def test_drop_removes_system_context_without_feeding_brain(self):
+        plugin = self.make_plugin(system_context_mode="drop")
+        self.brain_replies.append(BRIEF_RAW_WITH_SYSTEM)
+        req = ProviderRequest(
+            prompt="继续", contexts=self._history(), system_prompt="原始 SYS"
+        )
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        self.assertEqual(req.system_prompt, "")
+        dumped = json.dumps(req.contexts, ensure_ascii=False)
+        self.assertNotIn("你是猫娘", dumped)
+        self.assertNotIn("夹在中间的规则", dumped)
+        self.assertNotIn("原始 SYS", dumped)
+        self.assertFalse(
+            any(m.get("role") == "system" for m in req.contexts if isinstance(m, dict))
+        )
+        # drop 连聪明模型都不给看
+        self.assertNotIn("<system_context>", self.calls[0]["prompt"])
+
+    async def test_shadow_never_touches_request_even_in_drop(self):
+        plugin = self.make_plugin(mode="shadow", system_context_mode="drop")
+        self.brain_replies.append(BRIEF_RAW_WITH_SYSTEM)
+        history = [dict(self.PERSONA)] + make_history(4)
+        req = ProviderRequest(prompt="继续", contexts=history, system_prompt="原始 SYS")
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        self.assertEqual(req.system_prompt, "原始 SYS")
+        self.assertEqual(req.contexts, history)
+
+    async def test_brain_failure_keeps_system_context_even_in_drop(self):
+        plugin = self.make_plugin(system_context_mode="drop")
+        self.brain_replies.append(RuntimeError("接口 500"))
+        history = [dict(self.PERSONA)] + make_history(4)
+        req = ProviderRequest(prompt="继续", contexts=history, system_prompt="原始 SYS")
+        before = json.dumps(req.contexts, ensure_ascii=False)
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        self.assertEqual(req.system_prompt, "原始 SYS")
+        self.assertEqual(json.dumps(req.contexts, ensure_ascii=False), before)
+
+    async def test_skipped_turn_keeps_system_context(self):
+        """历史太短直接跳过时，也不能顺手把 system_prompt 清掉。"""
+        plugin = self.make_plugin(system_context_mode="drop")
+        req = ProviderRequest(
+            prompt="你好", contexts=make_history(1), system_prompt="原始 SYS"
+        )
+
+        await plugin.on_llm_request(FakeEvent(), req)
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(req.system_prompt, "原始 SYS")
+
+
+class SystemContextSettingsTest(BrokerTestCase):
+    def test_defaults_to_keep(self):
+        self.assertEqual(self.make_plugin()._read_settings().system_context_mode, "keep")
+
+    def test_reads_valid_mode(self):
+        plugin = self.make_plugin(system_context_mode="DIGEST")
+        self.assertEqual(plugin._read_settings().system_context_mode, "digest")
+
+    def test_dirty_mode_falls_back(self):
+        plugin = self.make_plugin(system_context_mode="随便写的")
+        self.assertEqual(plugin._read_settings().system_context_mode, "keep")
+
+    async def test_status_reports_mode(self):
+        plugin = self.make_plugin(system_context_mode="drop")
+        text = await plugin._cmd_status(FakeEvent())
+        self.assertIn("系统上下文：drop", text)
 
 
 # --------------------------------------------------------------------------- #

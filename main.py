@@ -112,6 +112,7 @@ class _Settings:
     exclude_sessions: List[str] = field(default_factory=list)
     debug_log: bool = False
     preserve_leading_system: bool = True
+    system_context_mode: str = "keep"
     sanitize_output: bool = True
     per_message_max_chars: int = cb.DEFAULT_PER_MESSAGE_MAX_CHARS
 
@@ -181,6 +182,9 @@ class ContextBrokerPlugin(Star):
             preserve_leading_system=_as_bool(
                 raw("preserve_leading_system", True), True
             ),
+            system_context_mode=cb.coerce_system_context_mode(
+                raw("system_context_mode", cb.DEFAULT_SYSTEM_CONTEXT_MODE)
+            ),
             sanitize_output=_as_bool(raw("sanitize_output", True), True),
         )
 
@@ -202,6 +206,57 @@ class ContextBrokerPlugin(Star):
             return None
         messages = [item for item in contexts if isinstance(item, dict)]
         return messages or None
+
+    @staticmethod
+    def _strip_system(
+        messages: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """去掉 role=system 的消息（digest/drop 下执行模型不该再看到它们）。"""
+        return [
+            message
+            for message in messages
+            if not (isinstance(message, dict) and message.get("role") == "system")
+        ]
+
+    def _apply_system_context_mode(
+        self,
+        settings: _Settings,
+        req: ProviderRequest,
+        brief: str,
+        system_material: str,
+    ) -> bool:
+        """按配置决定是否从执行模型侧移除系统上下文。
+
+        Returns:
+            是否真的移除了。返回 ``False`` 时调用方**不得**再过滤 system 消息，
+            否则会丢掉没有交给聪明模型备份的内容。
+        """
+        mode = settings.system_context_mode
+        if mode == "keep":
+            return False
+
+        if (
+            mode == "digest"
+            and system_material
+            and cb.SYSTEM_CONTEXT_HEADING not in brief
+        ):
+            self._logger.warning(
+                "[上下文代理] digest 模式下简报里没有「{}」一节，"
+                "为避免丢失系统设定，本轮不清空 system_prompt。"
+                "（自定义了 brief_instruction 时请在输出格式里保留该小节）".format(
+                    cb.SYSTEM_CONTEXT_HEADING
+                )
+            )
+            return False
+
+        req.system_prompt = ""
+        self._debug(
+            settings,
+            "{} 模式：已移除请求里的系统上下文（原文 {} 字符）。".format(
+                mode, len(system_material)
+            ),
+        )
+        return True
 
     def _brain_client(self, settings: _Settings) -> BrainClient:
         """按配置签名缓存 BrainClient，配置改了自动重建。"""
@@ -380,12 +435,19 @@ class ContextBrokerPlugin(Star):
             # 前导 system 已归入 preserved，必须从 delta 里剔除，否则会重复出现。
             delta = list(history[len(preserved) :])
 
-        if not settings.preserve_leading_system:
-            preserved = [
+        # 系统上下文：keep 下原样保留；digest/drop 下由本插件接管。
+        # 夹在历史中间的 system 消息也要算进来——稍后会把它们一并移除。
+        system_material = cb.resolve_system_material(
+            system_prompt=req.system_prompt,
+            system_messages=[
                 message
-                for message in preserved
-                if not (isinstance(message, dict) and message.get("role") == "system")
-            ]
+                for message in list(preserved) + list(delta)
+                if isinstance(message, dict) and message.get("role") == "system"
+            ],
+        )
+
+        if not settings.preserve_leading_system:
+            preserved = self._strip_system(preserved)
 
         # 正常对话里每轮都会新增 2 条消息，所以 delta 一般非空。
         # 这里只在「简报之后确实什么都没有」时短路（例如请求被重放）。
@@ -425,6 +487,9 @@ class ContextBrokerPlugin(Star):
             delta_text=delta_text,
             current_prompt=req.prompt or "",
             max_chars=settings.max_digest_chars,
+            system_text=(
+                system_material if settings.system_context_mode == "digest" else ""
+            ),
         )
 
         started = time.monotonic()
@@ -467,6 +532,10 @@ class ContextBrokerPlugin(Star):
             return
 
         recent = cb.tail_rounds(delta, settings.keep_recent_turns)
+        if self._apply_system_context_mode(settings, req, brief, system_material):
+            preserved = self._strip_system(preserved)
+            recent = self._strip_system(recent)
+
         req.contexts = cb.build_final_contexts(
             prefix=preserved,
             brief=brief,
@@ -653,6 +722,7 @@ class ContextBrokerPlugin(Star):
                 "是" if state else "否", cb.describe_state_reason(reason)
             ),
             "运行模式：{}".format(settings.mode),
+            "系统上下文：{}".format(settings.system_context_mode),
             "聪明模型：{}".format(
                 self._brain_model_label(settings.brain_provider_id)
                 if settings.brain_provider_id

@@ -325,6 +325,89 @@ class ResolveInstructionTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 系统上下文
+# --------------------------------------------------------------------------- #
+
+class CoerceSystemContextModeTest(unittest.TestCase):
+    def test_accepts_valid_modes(self):
+        for mode in cb.SYSTEM_CONTEXT_MODES:
+            self.assertEqual(cb.coerce_system_context_mode(mode), mode)
+
+    def test_normalises_case_and_padding(self):
+        self.assertEqual(cb.coerce_system_context_mode("  DIGEST "), "digest")
+        self.assertEqual(cb.coerce_system_context_mode("Drop"), "drop")
+
+    def test_falls_back_to_keep(self):
+        for value in (None, "", "   ", "kEep2", "off", 0, 1, [], {}, True):
+            self.assertEqual(
+                cb.coerce_system_context_mode(value),
+                cb.DEFAULT_SYSTEM_CONTEXT_MODE,
+            )
+            self.assertEqual(cb.coerce_system_context_mode(value), "keep")
+
+    def test_heading_is_markdown_section(self):
+        self.assertTrue(cb.SYSTEM_CONTEXT_HEADING.startswith("## "))
+
+
+class ResolveSystemMaterialTest(unittest.TestCase):
+    def test_empty_when_nothing_to_do(self):
+        for prompt in (None, "", "   ", "\n\t "):
+            self.assertEqual(
+                cb.resolve_system_material(system_prompt=prompt, system_messages=[]),
+                "",
+            )
+
+    def test_prompt_only(self):
+        self.assertEqual(
+            cb.resolve_system_material(system_prompt="人格", system_messages=[]),
+            "人格",
+        )
+
+    def test_messages_only(self):
+        material = cb.resolve_system_material(
+            system_prompt="",
+            system_messages=[msg("system", "规则一"), msg("system", "规则二")],
+        )
+        self.assertEqual(material, "规则一\n\n规则二")
+
+    def test_ignores_non_system_and_non_dict(self):
+        material = cb.resolve_system_material(
+            system_prompt="",
+            system_messages=[
+                msg("user", "用户说的话"),
+                msg("assistant", "助手说的话"),
+                "不是 dict",
+                None,
+                msg("system", "真正的系统消息"),
+            ],
+        )
+        self.assertEqual(material, "真正的系统消息")
+
+    def test_prompt_and_messages_together(self):
+        material = cb.resolve_system_material(
+            system_prompt="人格",
+            system_messages=[msg("system", "规则")],
+        )
+        self.assertEqual(material, "人格\n\n规则")
+
+    def test_deduplicates_repeated_text(self):
+        material = cb.resolve_system_material(
+            system_prompt="规则",
+            system_messages=[msg("system", "规则")],
+        )
+        self.assertEqual(material, "规则")
+
+    def test_multimodal_system_message_is_flattened(self):
+        material = cb.resolve_system_material(
+            system_prompt="",
+            system_messages=[
+                {"role": "system", "content": [{"type": "text", "text": "图片规则"}]},
+            ],
+        )
+        self.assertEqual(material, "图片规则")
+
+
+# --------------------------------------------------------------------------- #
 # 聪明模型 prompt
 # --------------------------------------------------------------------------- #
 
@@ -347,6 +430,41 @@ class BuildBrainPromptTest(unittest.TestCase):
         )
         self.assertIn("这是第一次整理", out)
         self.assertIn("（无新增历史）", out)
+
+    def test_system_context_absent_keeps_output_unchanged(self):
+        """不带 system_text 时输出必须与旧版逐字节一致（keep 模式零影响）。"""
+        kwargs = dict(
+            previous_brief="旧简报",
+            delta_text="user: 新消息",
+            current_prompt="然后呢",
+            max_chars=1500,
+        )
+        baseline = cb.build_brain_prompt(**kwargs)
+        self.assertEqual(baseline, cb.build_brain_prompt(system_text="", **kwargs))
+        self.assertNotIn("<system_context>", baseline)
+
+    def test_whitespace_system_text_is_ignored(self):
+        out = cb.build_brain_prompt(
+            previous_brief=None,
+            delta_text="user: x",
+            current_prompt="y",
+            max_chars=800,
+            system_text="   \n  ",
+        )
+        self.assertNotIn("<system_context>", out)
+
+    def test_system_context_block_precedes_history(self):
+        out = cb.build_brain_prompt(
+            previous_brief=None,
+            delta_text="user: 新消息",
+            current_prompt="然后呢",
+            max_chars=1500,
+            system_text="你是猫娘，必须自称本喵",
+        )
+        self.assertIn(
+            "<system_context>\n你是猫娘，必须自称本喵\n</system_context>", out
+        )
+        self.assertLess(out.index("<system_context>"), out.index("<history>"))
 
 
 class ParseBrainOutputTest(unittest.TestCase):
@@ -609,8 +727,21 @@ class SchemaConsistencyTest(unittest.TestCase):
             "carry_forward_brief", "include_standalone_question",
             "brief_instruction", "exclude_sessions", "debug_log",
             "preserve_leading_system", "sanitize_output",
+            "system_context_mode",
         }
         self.assertEqual(set(self.schema), expected)
+
+    def test_system_context_mode_options_match_code(self):
+        spec = self.schema["system_context_mode"]
+        self.assertEqual(tuple(spec["options"]), cb.SYSTEM_CONTEXT_MODES)
+        self.assertEqual(spec["default"], cb.DEFAULT_SYSTEM_CONTEXT_MODE)
+        for option in spec["options"]:
+            self.assertEqual(cb.coerce_system_context_mode(option), option)
+
+    def test_default_instruction_covers_system_contract(self):
+        """digest 依赖这两个约定，改指令时必须一起改。"""
+        self.assertIn(cb.SYSTEM_CONTEXT_HEADING, cb.DEFAULT_BRIEF_INSTRUCTION)
+        self.assertIn("<system_context>", cb.DEFAULT_BRIEF_INSTRUCTION)
 
     def test_types_are_supported(self):
         supported = {

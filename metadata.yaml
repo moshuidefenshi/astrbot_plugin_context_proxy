@@ -12,9 +12,11 @@ desc: >-
   支持增量摘要、超时/异常自动降级、安静的 shadow 评估模式，以及聊天内快捷开关：
   /上下文代理 开启、/上下文代理 关闭。
 
+  系统上下文可选择交给聪明模型压缩（system_context_mode），让弱模型不再被系统提示词压住。
+
   ⚠️ 注意：简报会被写入并持久化到会话历史（与 AstrBot 内置 llm_compress 策略同语义），
   被折叠的早期原文不会恢复。
-version: 1.0.0
+version: 1.1.0
 author: msdfs
 repo: https://github.com/moshuidefenshi/astrbot_plugin_context_proxy
 astrbot_version: ">=4.11,<5"
